@@ -5,7 +5,7 @@ from collections import deque
 from joblib import load 
 
 # === Load trained model ===
-model_file = 'hand_sign_model.pkl'
+model_file = 'models/hand_sign_model.pkl'
 
 try:
     model = load(model_file)
@@ -42,7 +42,7 @@ def normalize_landmarks(landmarks):
         landmarks /= max_val
     return landmarks.flatten()
 
-print("🚀 Starting Hand Sign Recognition...")
+print("Starting Hand Sign Recognition...")
 print("Press 'q' to quit, space to add to text, or 'c' to clear.\n")
 
 while True:

@@ -11,7 +11,7 @@ model = RandomForestClassifier(n_estimators=200, random_state=42)
 model.fit(X, y)
 
 # Save the trained model
-with open('hand_sign_model.pkl', 'wb') as f:
+with open('models/hand_sign_model.pkl', 'wb') as f:
     pickle.dump(model, f)
 
 print("Model trained and saved as hand_sign_model.pkl")
