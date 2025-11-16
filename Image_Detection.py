@@ -2,20 +2,41 @@ import cv2
 import mediapipe as mp
 import numpy as np
 from collections import deque
-from joblib import load 
+import pickle
+import os
 
 # === Load trained model ===
 model_file = 'models/hand_sign_model.pkl'
 
 try:
-    model = load(model_file)
-    print(f"Loaded model: {model_file}")
+    with open(model_file, 'rb') as f:
+        model_data = pickle.load(f)
+    
+    # Handle both old format (just model) and new format (dict with model and gestures)
+    if isinstance(model_data, dict):
+        model = model_data['model']
+        GESTURES = model_data['gestures']
+        print(f"Loaded model: {model_file}")
+        print(f"Loaded gesture mapping: {GESTURES}")
+    else:
+        # Old format - try to load gesture mapping from data directory
+        model = model_data
+        gesture_mapping_file = "data/gesture_mapping.pkl"
+        if os.path.exists(gesture_mapping_file):
+            with open(gesture_mapping_file, 'rb') as f:
+                GESTURES = pickle.load(f)
+            print(f"Loaded model: {model_file}")
+            print(f"Loaded gesture mapping from data directory: {GESTURES}")
+        else:
+            from config import GESTURES
+            print(f"Loaded model: {model_file}")
+            print(f"WARNING: No gesture mapping found. Using default from config: {GESTURES}")
 except FileNotFoundError:
     print("Model file not found. Train it first with train_model.py.")
     exit()
-
-# === Gesture mapping (update to match your GESTURES list) ===
-GESTURES = ["B","L","C"]
+except Exception as e:
+    print(f"Error loading model: {e}")
+    exit()
 
 # === Mediapipe setup ===
 mp_hands = mp.solutions.hands

@@ -2,10 +2,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import os
-
-# === CONFIG ===
-GESTURES = ["B","L","C"]
-SAMPLES_PER_GESTURE = 300
+import pickle
+from config import GESTURES, SAMPLES_PER_GESTURE
 
 # === Mediapipe setup ===
 mp_hands = mp.solutions.hands
@@ -21,6 +19,16 @@ def normalize_landmarks(landmarks):
     return landmarks.flatten()
 
 def collect_data_incremental():
+    # Load existing gesture mapping if it exists
+    gesture_mapping_file = "data/gesture_mapping.pkl"
+    if os.path.exists(gesture_mapping_file):
+        with open(gesture_mapping_file, 'rb') as f:
+            existing_gestures = pickle.load(f)
+        print(f"Loaded existing gesture mapping: {existing_gestures}")
+    else:
+        existing_gestures = []
+        print("No existing gesture mapping found, starting fresh")
+    
     # Try loading existing data
     if os.path.exists("data/landmarks.npy"):
         X_old = np.load("data/landmarks.npy")
@@ -31,13 +39,27 @@ def collect_data_incremental():
         y_old = np.empty((0,))
         print("No existing dataset found, starting fresh")
 
+    # Find which gestures are new (not in existing data)
+    new_gestures = [g for g in GESTURES if g not in existing_gestures]
+    
+    if not new_gestures:
+        print(f"\nAll gestures in GESTURES ({GESTURES}) already have data.")
+        print("To collect data for new gestures, add them to GESTURES in config.py")
+        return
+    
+    print(f"\nNew gestures to collect: {new_gestures}")
+    print(f"Existing gestures (skipped): {[g for g in GESTURES if g in existing_gestures]}")
+
     X_new = []
     y_new = []
 
     cap = cv2.VideoCapture(0)
     with mp_hands.Hands(max_num_hands=1, min_detection_confidence=0.7) as hands:
-        for label_idx, gesture_name in enumerate(GESTURES):
-            print(f"\nCollecting data for gesture: {gesture_name}")
+        for gesture_name in new_gestures:
+            # Assign label index: use existing length as starting point for new gestures
+            label_idx = len(existing_gestures) + new_gestures.index(gesture_name)
+            
+            print(f"\nCollecting data for gesture: {gesture_name} (label index: {label_idx})")
             print("Press 's' to start recording...")
             while True:
                 ret, frame = cap.read()
@@ -87,11 +109,22 @@ def collect_data_incremental():
     X_combined = np.concatenate((X_old, X_new))
     y_combined = np.concatenate((y_old, y_new))
 
+    # Update gesture mapping with new gestures
+    updated_gestures = existing_gestures + new_gestures
+    
+    # Ensure data directory exists
+    os.makedirs("data", exist_ok=True)
+    
     np.save("data/landmarks.npy", X_combined)
     np.save("data/labels.npy", y_combined)
+    
+    # Save updated gesture mapping
+    with open(gesture_mapping_file, 'wb') as f:
+        pickle.dump(updated_gestures, f)
 
     print(f"\nAdded {X_new.shape[0]} new samples.")
     print(f"Total dataset size: {X_combined.shape[0]} samples.")
+    print(f"Updated gesture mapping: {updated_gestures}")
 
 if __name__ == "__main__":
     collect_data_incremental()
