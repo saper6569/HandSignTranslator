@@ -4,8 +4,18 @@ import numpy as np
 from collections import deque
 import pickle
 import os
+import requests
 
-# === Load static hand sign model ===
+# ================================
+# ESP32 CAM STREAM SETUP
+# ================================
+ESP32_URL = "http://172.20.10.3:81/stream"
+stream = requests.get(ESP32_URL, stream=True)
+bytes_buffer = b""
+
+# ============================================
+# STATIC MODEL LOADING
+# ============================================
 static_model_file = 'models/hand_sign_model.pkl'
 static_model = None
 STATIC_GESTURES = None
@@ -13,49 +23,42 @@ STATIC_GESTURES = None
 try:
     with open(static_model_file, 'rb') as f:
         model_data = pickle.load(f)
-    
-    # Handle both old format (just model) and new format (dict with model and gestures)
+
     if isinstance(model_data, dict):
         static_model = model_data['model']
         STATIC_GESTURES = model_data['gestures']
         print(f"✓ Loaded static model: {static_model_file}")
-        print(f"  Static gestures: {STATIC_GESTURES}")
     else:
-        # Old format - try to load gesture mapping from data directory
         static_model = model_data
         gesture_mapping_file = "data/gesture_mapping.pkl"
         if os.path.exists(gesture_mapping_file):
             with open(gesture_mapping_file, 'rb') as f:
                 STATIC_GESTURES = pickle.load(f)
-            print(f"✓ Loaded static model: {static_model_file}")
-            print(f"  Static gestures: {STATIC_GESTURES}")
+            print(f"✓ Loaded static model + gesture mapping (legacy)")
         else:
             from config import GESTURES
-            STATIC_GESTURES = GESTURES
-            print(f"✓ Loaded static model: {static_model_file}")
-            print(f"  WARNING: Using default static gestures from config: {STATIC_GESTURES}")
-except FileNotFoundError:
-    print("⚠ Static model file not found. Static detection will be disabled.")
-except Exception as e:
-    print(f"⚠ Error loading static model: {e}. Static detection will be disabled.")
 
-# === Load sequence (movement) model ===
+            STATIC_GESTURES = GESTURES
+            print("⚠ Using default gesture mapping (no mapping file found).")
+except Exception as e:
+    print(f"⚠ Static model load failed: {e}")
+
+# ============================================
+# MOVEMENT (SEQUENCE) MODEL LOADING
+# ============================================
 sequence_model = None
 MOVEMENT_GESTURES = None
 SEQUENCE_LENGTH = None
 sequence_model_type = None
-sequence_scaler = None  # For sklearn models that need scaling
+sequence_scaler = None
 
-# Try to load TensorFlow/Keras model
+# Try TensorFlow/Keras first
 try:
     from tensorflow import keras
+
     TENSORFLOW_AVAILABLE = True
 except ImportError:
-    try:
-        import keras
-        TENSORFLOW_AVAILABLE = True
-    except ImportError:
-        TENSORFLOW_AVAILABLE = False
+    TENSORFLOW_AVAILABLE = False
 
 if TENSORFLOW_AVAILABLE:
     try:
@@ -63,50 +66,38 @@ if TENSORFLOW_AVAILABLE:
         if os.path.exists(metadata_file):
             with open(metadata_file, 'rb') as f:
                 metadata = pickle.load(f)
+
             MOVEMENT_GESTURES = metadata['gestures']
             SEQUENCE_LENGTH = metadata['sequence_length']
             sequence_model_type = metadata['model_type']
-            
-            model_file = 'models/sequence_model.h5'
-            sequence_model = keras.models.load_model(model_file)
-            print(f"✓ Loaded sequence model: {model_file}")
-            print(f"  Movement gestures: {MOVEMENT_GESTURES}")
-            print(f"  Sequence length: {SEQUENCE_LENGTH}")
-    except Exception as e:
-        print(f"⚠ Error loading Keras sequence model: {e}")
 
-# Try to load sklearn fallback model if Keras model not available
+            sequence_model = keras.models.load_model('models/sequence_model.h5')
+            print(f"✓ Loaded Keras sequence model (LSTM)")
+    except Exception as e:
+        print(f"⚠ Keras model failed: {e}")
+
+# Fall back to sklearn sequence model
 if sequence_model is None:
     try:
-        model_file = 'models/sequence_model.pkl'
-        with open(model_file, 'rb') as f:
+        with open('models/sequence_model.pkl', 'rb') as f:
             model_data = pickle.load(f)
         sequence_model = model_data['model']
         MOVEMENT_GESTURES = model_data['gestures']
         SEQUENCE_LENGTH = model_data['sequence_length']
         sequence_model_type = model_data['model_type']
-        
-        # Load scaler if it exists (for RandomForest)
-        if 'scaler' in model_data:
-            sequence_scaler = model_data['scaler']
-        else:
-            sequence_scaler = None
-        
-        print(f"✓ Loaded sequence model: {model_file}")
-        print(f"  Movement gestures: {MOVEMENT_GESTURES}")
-        print(f"  Sequence length: {SEQUENCE_LENGTH}")
-        print(f"  Model type: {sequence_model_type}")
-    except FileNotFoundError:
-        print("⚠ Sequence model file not found. Movement detection will be disabled.")
-    except Exception as e:
-        print(f"⚠ Error loading sequence model: {e}. Movement detection will be disabled.")
+        sequence_scaler = model_data.get('scaler', None)
+        print(f"✓ Loaded sklearn sequence model")
+    except:
+        print("⚠ No sequence model found.")
 
-# Check if we have at least one model
+# If no models at all, exit
 if static_model is None and sequence_model is None:
-    print("❌ Error: No models found. Please train at least one model.")
+    print("❌ No models available. Exiting.")
     exit()
 
-# === Mediapipe setup ===
+# ============================================
+# Mediapipe Setup
+# ============================================
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
@@ -116,18 +107,20 @@ hands = mp_hands.Hands(
     min_tracking_confidence=0.7
 )
 
-# === Webcam setup ===
-cap = cv2.VideoCapture(0)
-text_buffer = deque(maxlen=30)  # For static gesture smoothing
+# ============================================
+# Buffers & Settings
+# ============================================
+text_buffer = deque(maxlen=30)
 output_text = ""
 
-# === Sequence buffer for movement detection ===
 sequence_buffer = deque(maxlen=SEQUENCE_LENGTH if SEQUENCE_LENGTH else 30)
 frame_counter = 0
-FRAME_SKIP = 1  # Match config
+FRAME_SKIP = 1
+
+detection_mode = "auto"
+
 
 def normalize_landmarks(landmarks):
-    """Normalize so model sees consistent positions"""
     landmarks = np.array(landmarks).reshape(-1, 3)
     wrist = landmarks[0]
     landmarks -= wrist
@@ -136,30 +129,37 @@ def normalize_landmarks(landmarks):
         landmarks /= max_val
     return landmarks.flatten()
 
-# Detection mode: 'auto', 'static', or 'movement'
-detection_mode = 'auto'
 
-print("\n" + "="*60)
-print("Hand Sign Recognition System")
-print("="*60)
-if static_model:
-    print(f"✓ Static detection enabled: {len(STATIC_GESTURES)} gestures")
-if sequence_model:
-    print(f"✓ Movement detection enabled: {len(MOVEMENT_GESTURES)} gestures")
-print("\nControls:")
-print("  'q' - Quit")
-print("  ' ' (space) - Add current detection to text")
-print("  'c' - Clear output text")
-print("  'a' - Auto mode (detect both static and movement)")
-print("  's' - Static mode only")
-print("  'm' - Movement mode only")
-print("="*60 + "\n")
+print("\n=== Hand Sign Recognition System (ESP32 Stream) ===")
+print("Modes: a=auto, s=static, m=movement, space=add word, c=clear, q=quit\n")
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+# ============================================
+# MAIN LOOP — READ FROM ESP32 STREAM
+# ============================================
+for chunk in stream.iter_content(chunk_size=4096):
 
+    if not chunk:
+        continue
+
+    bytes_buffer += chunk
+
+    # Find JPEG markers
+    jpg_start = bytes_buffer.find(b'\xff\xd8')
+    jpg_end = bytes_buffer.find(b'\xff\xd9', jpg_start)
+
+    if jpg_start == -1 or jpg_end == -1:
+        continue
+
+    jpg = bytes_buffer[jpg_start:jpg_end + 2]
+    bytes_buffer = bytes_buffer[jpg_end + 2:]
+
+    frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        continue
+
+    # =============================
+    # PROCESS FRAME
+    # =============================
     frame = cv2.flip(frame, 1)
     h, w, _ = frame.shape
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -170,129 +170,102 @@ while True:
 
     if result.multi_hand_landmarks:
         for hand_landmarks in result.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(
-                frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-            # Extract and normalize landmarks
-            landmarks = [[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark]
-            landmarks = normalize_landmarks(landmarks)
+            lm = [[p.x, p.y, p.z] for p in hand_landmarks.landmark]
+            lm_norm = normalize_landmarks(lm)
 
-            # === Static Detection ===
-            if (detection_mode in ['auto', 'static']) and static_model is not None:
+            # ------------------------------
+            # STATIC MODEL PREDICTION
+            # ------------------------------
+            if (detection_mode in ["auto", "static"]) and static_model is not None:
                 try:
-                    pred_idx = static_model.predict([landmarks])[0]
-                    if hasattr(pred_idx, '__iter__') and len(pred_idx) > 0:
-                        pred_idx = int(pred_idx[0])
-                    else:
-                        pred_idx = int(pred_idx)
-                    
-                    static_prediction = STATIC_GESTURES[pred_idx]
-                    
-                    if detection_mode == 'static':
-                        current_prediction = static_prediction
-                        prediction_type = "Static"
-                    elif detection_mode == 'auto':
-                        # In auto mode, prefer static detection
-                        current_prediction = static_prediction
-                        prediction_type = "Static"
-                except Exception as e:
+                    idx = static_model.predict([lm_norm])[0]
+                    idx = int(idx[0]) if hasattr(idx, '__len__') else int(idx)
+                    static_pred = STATIC_GESTURES[idx]
+                    current_prediction = static_pred
+                    prediction_type = "Static"
+                except:
                     pass
 
-            # === Movement Detection ===
-            if (detection_mode in ['auto', 'movement']) and sequence_model is not None and SEQUENCE_LENGTH is not None:
-                # Add to sequence buffer
+            # ------------------------------
+            # MOVEMENT MODEL PREDICTION
+            # ------------------------------
+            if (detection_mode in ["auto", "movement"]) and sequence_model:
                 if frame_counter % FRAME_SKIP == 0:
-                    sequence_buffer.append(landmarks)
+                    sequence_buffer.append(lm_norm)
                 frame_counter += 1
 
-                # When buffer is full, try to detect movement
                 if len(sequence_buffer) == SEQUENCE_LENGTH:
+                    seq = np.array(sequence_buffer).reshape(1, SEQUENCE_LENGTH, -1)
+
                     try:
-                        sequence = np.array(list(sequence_buffer))
-                        sequence = sequence.reshape(1, SEQUENCE_LENGTH, -1)  # (1, seq_len, features)
-
-                        if sequence_model_type == 'lstm' and TENSORFLOW_AVAILABLE:
-                            # Keras LSTM model
-                            predictions = sequence_model.predict(sequence, verbose=0)
-                            pred_idx = np.argmax(predictions[0])
+                        if sequence_model_type == "lstm" and TENSORFLOW_AVAILABLE:
+                            probs = sequence_model.predict(seq, verbose=0)[0]
+                            idx = int(np.argmax(probs))
                         else:
-                            # sklearn model (RandomForest) - flatten and scale if needed
-                            sequence_flat = sequence.reshape(1, -1)
-                            if sequence_scaler is not None:
-                                sequence_flat = sequence_scaler.transform(sequence_flat)
-                            pred_idx = sequence_model.predict(sequence_flat)[0]
-                        
-                        movement_prediction = MOVEMENT_GESTURES[int(pred_idx)]
-                        
-                        # Only use movement detection if:
-                        # 1. We're in movement mode, OR
-                        # 2. We're in auto mode
-                        # PRIORITIZE MOVEMENT in auto mode
-                        if detection_mode == 'movement' or detection_mode == 'auto':
-                            current_prediction = movement_prediction
-                            prediction_type = "Movement"
+                            flat = seq.reshape(1, -1)
+                            if sequence_scaler:
+                                flat = sequence_scaler.transform(flat)
+                            idx = int(sequence_model.predict(flat)[0])
 
-                    except Exception as e:
+                        movement_pred = MOVEMENT_GESTURES[idx]
+                        current_prediction = movement_pred
+                        prediction_type = "Movement"
+                    except:
                         pass
 
-            # Display current prediction
-            if current_prediction:
-                text_buffer.append(current_prediction)
-                
-                # Smoothed prediction
-                if len(text_buffer) >= 10:
-                    most_common = max(set(text_buffer), key=text_buffer.count)
-                    color = (0, 255, 0) if prediction_type == "Static" else (0, 255, 255)
-                    cv2.putText(frame, f"{prediction_type}: {most_common}", (10, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-                    cv2.putText(frame, f"Mode: {detection_mode.upper()}", (10, 90),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-                    
-                    # Show sequence buffer progress for movement mode
-                    if sequence_model and SEQUENCE_LENGTH and detection_mode in ['auto', 'movement']:
-                        buffer_progress = len(sequence_buffer) / SEQUENCE_LENGTH
-                        cv2.rectangle(frame, (10, h - 60), (210, h - 30), (100, 100, 100), 2)
-                        cv2.rectangle(frame, (10, h - 60), (10 + int(200 * buffer_progress), h - 30), (0, 255, 255), -1)
-                        cv2.putText(frame, f"Buffer: {len(sequence_buffer)}/{SEQUENCE_LENGTH}", 
-                                    (220, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    # =============================
+    # SMOOTHING & DISPLAY
+    # =============================
+    if current_prediction:
+        text_buffer.append(current_prediction)
+
+        if len(text_buffer) >= 10:
+            final_pred = max(set(text_buffer), key=text_buffer.count)
+            color = (0, 255, 0) if prediction_type == "Static" else (0, 255, 255)
+
+            cv2.putText(frame, f"{prediction_type}: {final_pred}", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
+
     else:
         cv2.putText(frame, "No hand detected", (10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-        cv2.putText(frame, f"Mode: {detection_mode.upper()}", (10, 90),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
-    # Display recognized text
+    cv2.putText(frame, f"Mode: {detection_mode.upper()}", (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
     cv2.putText(frame, f"Text: {output_text}", (10, h - 20),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
-    cv2.imshow("Hand Sign to Text", frame)
+    cv2.imshow("ESP32 Hand Sign Recognition", frame)
 
-    # Keyboard controls
+    # =============================
+    # KEYBOARD CONTROLS
+    # =============================
     key = cv2.waitKey(1) & 0xFF
+
     if key == ord('q'):
         break
-    elif key == ord(' '):  # Space = append current word
-        if len(text_buffer) > 0:
-            most_common = max(set(text_buffer), key=text_buffer.count)
-            output_text += most_common + " "
+    elif key == ord(' '):
+        if len(text_buffer):
+            output_text += max(set(text_buffer), key=text_buffer.count) + " "
             text_buffer.clear()
-            sequence_buffer.clear()  # Clear sequence buffer after adding text
-    elif key == ord('c'):  # Clear output text
+            sequence_buffer.clear()
+    elif key == ord('c'):
         output_text = ""
         text_buffer.clear()
         sequence_buffer.clear()
-    elif key == ord('a'):  # Auto mode
-        detection_mode = 'auto'
-        print("Mode: AUTO (detecting both static and movement)")
-    elif key == ord('s'):  # Static mode
-        detection_mode = 'static'
-        print("Mode: STATIC (static gestures only)")
+    elif key == ord('a'):
+        detection_mode = "auto"
+        print("Mode → AUTO")
+    elif key == ord('s'):
+        detection_mode = "static"
         sequence_buffer.clear()
-    elif key == ord('m'):  # Movement mode
-        detection_mode = 'movement'
-        print("Mode: MOVEMENT (movement gestures only)")
+        print("Mode → STATIC")
+    elif key == ord('m'):
+        detection_mode = "movement"
         text_buffer.clear()
+        print("Mode → MOVEMENT")
 
-cap.release()
 cv2.destroyAllWindows()
-

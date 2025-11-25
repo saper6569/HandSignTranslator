@@ -10,7 +10,7 @@ SAMPLES_PER_GESTURE = 300
 
 # === Sequence-based (movement) gesture settings ===
 # Gestures that require movement to be recognized
-MOVEMENT_GESTURES = ["Hello"]
+MOVEMENT_GESTURES = ["Hello", "We"]
 
 # Number of sequences to collect per movement gesture
 SEQUENCES_PER_GESTURE = 20
