@@ -5,43 +5,72 @@ from collections import deque
 import pickle
 import os
 import requests
+import time
+
+from config import LOW_LIGHT
 
 # ================================
-# ESP32 CAM STREAM SETUP
+# CAMERA SOURCE SETUP
 # ================================
-ESP32_URL = "http://172.20.10.3:81/stream"
-stream = requests.get(ESP32_URL, stream=True)
+use_webcam = False  # Start with ESP32 stream
+ESP32_IP = "172.20.10.3"
+ESP32_URL = f"http://{ESP32_IP}:81/stream"
+adc_url = f"http://{ESP32_IP}/adc"
+
+# Initialize ESP32 stream
+stream = None
+stream_iterator = None
 bytes_buffer = b""
+webcam = None
 
-# ============================================
-# STATIC MODEL LOADING
-# ============================================
-static_model_file = 'models/hand_sign_model.pkl'
-static_model = None
-STATIC_GESTURES = None
+def init_esp32_stream():
+    """Initialize ESP32 stream connection"""
+    global stream, stream_iterator, bytes_buffer
+    try:
+        stream = requests.get(ESP32_URL, stream=True, timeout=5)
+        # Use larger chunk size for better performance with ESP32
+        stream_iterator = stream.iter_content(chunk_size=8192)
+        bytes_buffer = b""
+        return True
+    except Exception as e:
+        print(f"Error connecting to ESP32 stream: {e}")
+        return False
 
-try:
-    with open(static_model_file, 'rb') as f:
-        model_data = pickle.load(f)
+def init_webcam():
+    """Initialize webcam capture"""
+    global webcam
+    try:
+        webcam = cv2.VideoCapture(0)
+        if webcam.isOpened():
+            webcam.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            webcam.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            return True
+        return False
+    except Exception as e:
+        print(f"Error initializing webcam: {e}")
+        return False
 
-    if isinstance(model_data, dict):
-        static_model = model_data['model']
-        STATIC_GESTURES = model_data['gestures']
-        print(f"✓ Loaded static model: {static_model_file}")
-    else:
-        static_model = model_data
-        gesture_mapping_file = "data/gesture_mapping.pkl"
-        if os.path.exists(gesture_mapping_file):
-            with open(gesture_mapping_file, 'rb') as f:
-                STATIC_GESTURES = pickle.load(f)
-            print(f"✓ Loaded static model + gesture mapping (legacy)")
-        else:
-            from config import GESTURES
+def cleanup_esp32_stream():
+    """Clean up ESP32 stream connection"""
+    global stream, stream_iterator, bytes_buffer
+    if stream:
+        try:
+            stream.close()
+        except:
+            pass
+    stream = None
+    stream_iterator = None
+    bytes_buffer = b""
 
-            STATIC_GESTURES = GESTURES
-            print("⚠ Using default gesture mapping (no mapping file found).")
-except Exception as e:
-    print(f"⚠ Static model load failed: {e}")
+def cleanup_webcam():
+    """Clean up webcam capture"""
+    global webcam
+    if webcam:
+        try:
+            webcam.release()
+        except:
+            pass
+    webcam = None
 
 # ============================================
 # MOVEMENT (SEQUENCE) MODEL LOADING
@@ -90,9 +119,9 @@ if sequence_model is None:
     except:
         print("⚠ No sequence model found.")
 
-# If no models at all, exit
-if static_model is None and sequence_model is None:
-    print("❌ No models available. Exiting.")
+# Exit if no movement model available
+if sequence_model is None:
+    print("❌ No movement model available. Exiting.")
     exit()
 
 # ============================================
@@ -110,14 +139,28 @@ hands = mp_hands.Hands(
 # ============================================
 # Buffers & Settings
 # ============================================
-text_buffer = deque(maxlen=30)
-output_text = ""
-
 sequence_buffer = deque(maxlen=SEQUENCE_LENGTH if SEQUENCE_LENGTH else 30)
 frame_counter = 0
 FRAME_SKIP = 1
 
-detection_mode = "auto"
+# ADC checking variables
+last_adc_check = 0
+adc_check_interval = 2.0  # Check ADC every 2 seconds
+low_light = False
+
+# Performance optimization settings
+PROCESS_WIDTH = 640   # Process MediaPipe on smaller frame for better performance
+PROCESS_HEIGHT = 480
+DISPLAY_WIDTH = 1280
+DISPLAY_HEIGHT = 960
+FRAME_SKIP_WEBCAM = 1  # Process every Nth frame for webcam (1 = all frames)
+FRAME_SKIP_ESP32 = 3   # Process every Nth frame for ESP32 (2 = every other frame for better performance)
+
+# Cache last detection result to prevent flickering when frames are skipped
+cached_result = None
+cached_hand_landmarks = None
+cached_prediction_text = None  # Cache the displayed prediction text
+no_hand_frame_count = 0  # Track consecutive frames with no hand
 
 
 def normalize_landmarks(landmarks):
@@ -130,142 +173,283 @@ def normalize_landmarks(landmarks):
     return landmarks.flatten()
 
 
-print("\n=== Hand Sign Recognition System (ESP32 Stream) ===")
-print("Modes: a=auto, s=static, m=movement, space=add word, c=clear, q=quit\n")
+def get_adc_value():
+    """Fetch ADC value from ESP32"""
+    try:
+        response = requests.get(adc_url, timeout=0.3)
+        data = response.json()
+        return data['adc_raw']
+    except:
+        return None
+
+
+print("\n=== Hand Sign Recognition System (Movement Only) ===")
+print("Controls: q=quit, w=switch camera source\n")
+
+# Initialize starting camera source
+if not use_webcam:
+    if not init_esp32_stream():
+        print("Failed to connect to ESP32 stream. Switching to webcam...")
+        use_webcam = True
+        if not init_webcam():
+            print("Error: Could not initialize webcam. Exiting...")
+            exit()
+else:
+    if not init_webcam():
+        print("Error: Could not initialize webcam. Exiting...")
+        exit()
+
+# Create named window and resize it
+window_name = "Hand Sign Recognition (Movement)"
+cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(window_name, DISPLAY_WIDTH, DISPLAY_HEIGHT)
 
 # ============================================
-# MAIN LOOP — READ FROM ESP32 STREAM
+# MAIN LOOP
 # ============================================
-for chunk in stream.iter_content(chunk_size=4096):
+running = True
 
-    if not chunk:
+while running:
+    # Handle camera source switching
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('w'):
+        # Switch camera source
+        if use_webcam:
+            cleanup_webcam()
+            use_webcam = False
+            frame_counter = 0  # Reset frame counter when switching
+            cached_result = None  # Clear cache when switching cameras
+            cached_hand_landmarks = None
+            cached_prediction_text = None  # Clear cached prediction when switching
+            no_hand_frame_count = 0  # Reset no hand frame count
+            sequence_buffer.clear()  # Clear sequence buffer when switching
+            if init_esp32_stream():
+                print("Switched to ESP32 stream")
+            else:
+                print("Failed to connect to ESP32 stream. Staying on webcam...")
+                init_webcam()
+                use_webcam = True
+        else:
+            cleanup_esp32_stream()
+            use_webcam = True
+            frame_counter = 0  # Reset frame counter when switching
+            cached_result = None  # Clear cache when switching cameras
+            cached_hand_landmarks = None
+            cached_prediction_text = None  # Clear cached prediction when switching
+            no_hand_frame_count = 0  # Reset no hand frame count
+            sequence_buffer.clear()  # Clear sequence buffer when switching
+            if init_webcam():
+                print("Switched to webcam")
+            else:
+                print("Failed to initialize webcam. Staying on ESP32 stream...")
+                init_esp32_stream()
+                use_webcam = False
         continue
+    elif key == ord('q'):
+        break
 
-    bytes_buffer += chunk
+    frame = None
 
-    # Find JPEG markers
-    jpg_start = bytes_buffer.find(b'\xff\xd8')
-    jpg_end = bytes_buffer.find(b'\xff\xd9', jpg_start)
+    # Get frame from current source
+    if use_webcam:
+        # Read from webcam
+        if webcam and webcam.isOpened():
+            ret, frame = webcam.read()
+            if not ret:
+                continue
+        else:
+            continue
+    else:
+        # Read from ESP32 stream
+        if not stream or stream_iterator is None:
+            continue
+        
+        try:
+            # Read multiple chunks at once for better performance
+            # Read until we have a complete JPEG frame
+            max_chunks = 20  # Limit to prevent infinite loop
+            chunks_read = 0
+            while chunks_read < max_chunks:
+                chunk = next(stream_iterator, None)
+                if chunk is None or len(chunk) == 0:
+                    # Stream ended, try to reconnect
+                    raise StopIteration
+                    
+                bytes_buffer += chunk
+                chunks_read += 1
 
-    if jpg_start == -1 or jpg_end == -1:
-        continue
+                # Find JPEG start/end markers (skip header if present)
+                jpg_start = bytes_buffer.find(b'\xff\xd8')
+                if jpg_start == -1:
+                    continue
+                    
+                jpg_end = bytes_buffer.find(b'\xff\xd9', jpg_start)
+                if jpg_end == -1:
+                    continue
 
-    jpg = bytes_buffer[jpg_start:jpg_end + 2]
-    bytes_buffer = bytes_buffer[jpg_end + 2:]
+                # Extract JPEG frame
+                jpg = bytes_buffer[jpg_start:jpg_end + 2]
+                bytes_buffer = bytes_buffer[jpg_end + 2:]
+                frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                
+                if frame is not None:
+                    break
+            
+        except (StopIteration, requests.RequestException, Exception) as e:
+            # Stream ended or error, try to reconnect
+            print(f"ESP32 stream disconnected: {e}. Attempting to reconnect...")
+            cleanup_esp32_stream()
+            time.sleep(1)
+            if init_esp32_stream():
+                print("Reconnected to ESP32 stream")
+            else:
+                print("Reconnection failed. Switching to webcam...")
+                use_webcam = True
+                if not init_webcam():
+                    print("Failed to initialize webcam. Exiting...")
+                    running = False
+            continue
 
-    frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
         continue
 
     # =============================
     # PROCESS FRAME
     # =============================
-    frame = cv2.flip(frame, 1)
+    # Only flip if using ESP32 (not webcam)
+    if not use_webcam:
+        frame = cv2.flip(frame, 1)
+        # Rotate frame 90 degrees clockwise (camera is lying on its side)
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
     h, w, _ = frame.shape
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb)
+    
+    # Increment frame counter for frame skipping
+    frame_counter += 1
+    
+    # Resize frame for processing (smaller = faster MediaPipe processing)
+    # This is especially important for ESP32 streams which may be higher resolution
+    frame_process = cv2.resize(frame, (PROCESS_WIDTH, PROCESS_HEIGHT))
+
+    # === CHECK LIGHT LEVEL (only for ESP32, every 2 seconds) ===
+    if not use_webcam:
+        current_time = time.time()
+        if current_time - last_adc_check >= adc_check_interval:
+            adc_value = get_adc_value()
+            if adc_value is not None:
+                print(f"ADC Value: {adc_value}")
+                low_light = adc_value < LOW_LIGHT
+            last_adc_check = current_time
+    else:
+        # Reset low_light when using webcam (no ADC available)
+        low_light = False
+
+    # Resize frame for display
+    frame_display = cv2.resize(frame, (DISPLAY_WIDTH, DISPLAY_HEIGHT))
+    display_h, display_w, _ = frame_display.shape
+
+    # Display current camera source
+    source_text = "Webcam" if use_webcam else "ESP32 Stream"
+    cv2.putText(frame_display, f"Source: {source_text}", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    # Show low light warning if light is insufficient (ESP32 only)
+    if low_light and not use_webcam:
+        cv2.putText(frame_display, "Low confidence due to low light", (20, 100),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 4)
+
+    # Process hand detection only on frames we want to process (frame skipping)
+    # Use different skip rates for ESP32 vs webcam (ESP32 needs more skipping for performance)
+    current_frame_skip = FRAME_SKIP_ESP32 if not use_webcam else FRAME_SKIP_WEBCAM
+    
+    result = None
+    hand_landmarks_to_draw = None
+    
+    if frame_counter % current_frame_skip == 0:
+        # Process on smaller frame for better performance
+        # MediaPipe landmarks are normalized (0-1), so they'll work correctly on any frame size
+        rgb = cv2.cvtColor(frame_process, cv2.COLOR_BGR2RGB)
+        result = hands.process(rgb)
+        
+        # Update cache with latest result
+        if result.multi_hand_landmarks:
+            cached_result = result
+            cached_hand_landmarks = result.multi_hand_landmarks[0]  # Cache first hand
+            no_hand_frame_count = 0  # Reset counter when hand is detected
+        else:
+            # Clear cache if no hand detected
+            cached_result = result
+            cached_hand_landmarks = None
+            no_hand_frame_count += 1
+            # Clear cached prediction after multiple consecutive "no hand" detections
+            if no_hand_frame_count >= 5:  # Clear after 5 processed frames with no hand
+                cached_prediction_text = None
+    else:
+        # Use cached result when skipping frames to prevent flickering
+        if cached_result is not None:
+            result = cached_result
+            hand_landmarks_to_draw = cached_hand_landmarks
+
+    # Determine which landmarks to draw
+    if result is not None and result.multi_hand_landmarks:
+        hand_landmarks_to_draw = result.multi_hand_landmarks[0]
+    elif hand_landmarks_to_draw is None and cached_hand_landmarks is not None:
+        hand_landmarks_to_draw = cached_hand_landmarks
 
     current_prediction = None
-    prediction_type = None
 
-    if result.multi_hand_landmarks:
-        for hand_landmarks in result.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-            lm = [[p.x, p.y, p.z] for p in hand_landmarks.landmark]
+    if hand_landmarks_to_draw is not None:
+        # Hand landmarks drawing removed - only processing for prediction
+        
+        # Only process landmarks on frames we're processing (not skipped ones)
+        if frame_counter % current_frame_skip == 0 and result is not None and result.multi_hand_landmarks:
+            lm = [[p.x, p.y, p.z] for p in hand_landmarks_to_draw.landmark]
             lm_norm = normalize_landmarks(lm)
-
-            # ------------------------------
-            # STATIC MODEL PREDICTION
-            # ------------------------------
-            if (detection_mode in ["auto", "static"]) and static_model is not None:
-                try:
-                    idx = static_model.predict([lm_norm])[0]
-                    idx = int(idx[0]) if hasattr(idx, '__len__') else int(idx)
-                    static_pred = STATIC_GESTURES[idx]
-                    current_prediction = static_pred
-                    prediction_type = "Static"
-                except:
-                    pass
 
             # ------------------------------
             # MOVEMENT MODEL PREDICTION
             # ------------------------------
-            if (detection_mode in ["auto", "movement"]) and sequence_model:
-                if frame_counter % FRAME_SKIP == 0:
-                    sequence_buffer.append(lm_norm)
-                frame_counter += 1
+            # Append to sequence buffer (only on processed frames)
+            sequence_buffer.append(lm_norm)
 
-                if len(sequence_buffer) == SEQUENCE_LENGTH:
-                    seq = np.array(sequence_buffer).reshape(1, SEQUENCE_LENGTH, -1)
+            if len(sequence_buffer) == SEQUENCE_LENGTH:
+                seq = np.array(sequence_buffer).reshape(1, SEQUENCE_LENGTH, -1)
 
-                    try:
-                        if sequence_model_type == "lstm" and TENSORFLOW_AVAILABLE:
-                            probs = sequence_model.predict(seq, verbose=0)[0]
-                            idx = int(np.argmax(probs))
-                        else:
-                            flat = seq.reshape(1, -1)
-                            if sequence_scaler:
-                                flat = sequence_scaler.transform(flat)
-                            idx = int(sequence_model.predict(flat)[0])
+                try:
+                    if sequence_model_type == "lstm" and TENSORFLOW_AVAILABLE:
+                        probs = sequence_model.predict(seq, verbose=0)[0]
+                        idx = int(np.argmax(probs))
+                    else:
+                        flat = seq.reshape(1, -1)
+                        if sequence_scaler:
+                            flat = sequence_scaler.transform(flat)
+                        idx = int(sequence_model.predict(flat)[0])
 
-                        movement_pred = MOVEMENT_GESTURES[idx]
-                        current_prediction = movement_pred
-                        prediction_type = "Movement"
-                    except:
-                        pass
-
-    # =============================
-    # SMOOTHING & DISPLAY
-    # =============================
-    if current_prediction:
-        text_buffer.append(current_prediction)
-
-        if len(text_buffer) >= 10:
-            final_pred = max(set(text_buffer), key=text_buffer.count)
-            color = (0, 255, 0) if prediction_type == "Static" else (0, 255, 255)
-
-            cv2.putText(frame, f"{prediction_type}: {final_pred}", (10, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
-
-    else:
-        cv2.putText(frame, "No hand detected", (10, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
-
-    cv2.putText(frame, f"Mode: {detection_mode.upper()}", (10, 90),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-    cv2.putText(frame, f"Text: {output_text}", (10, h - 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-
-    cv2.imshow("ESP32 Hand Sign Recognition", frame)
+                    current_prediction = MOVEMENT_GESTURES[idx]
+                    # Update cached prediction when we get a new one
+                    if current_prediction:
+                        cached_prediction_text = current_prediction
+                except:
+                    pass
 
     # =============================
-    # KEYBOARD CONTROLS
+    # DISPLAY
     # =============================
-    key = cv2.waitKey(1) & 0xFF
+    # Use cached prediction to prevent flickering on skipped frames
+    display_prediction = current_prediction if current_prediction else cached_prediction_text
+    
+    if display_prediction and not low_light:
+        text_y = 140 if low_light and not use_webcam else 100
+        cv2.putText(frame_display, f" {display_prediction}", (20, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 255, 255), 4)
+    elif not display_prediction and cached_hand_landmarks is None and not low_light:
+        # Only show "No hand detected" if we don't have a cached result or prediction
+        text_y = 140 if use_webcam else 100
+        cv2.putText(frame_display, "No hand detected", (20, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 0, 255), 4)
 
-    if key == ord('q'):
-        break
-    elif key == ord(' '):
-        if len(text_buffer):
-            output_text += max(set(text_buffer), key=text_buffer.count) + " "
-            text_buffer.clear()
-            sequence_buffer.clear()
-    elif key == ord('c'):
-        output_text = ""
-        text_buffer.clear()
-        sequence_buffer.clear()
-    elif key == ord('a'):
-        detection_mode = "auto"
-        print("Mode → AUTO")
-    elif key == ord('s'):
-        detection_mode = "static"
-        sequence_buffer.clear()
-        print("Mode → STATIC")
-    elif key == ord('m'):
-        detection_mode = "movement"
-        text_buffer.clear()
-        print("Mode → MOVEMENT")
+    cv2.imshow(window_name, frame_display)
 
+# Cleanup
+cleanup_esp32_stream()
+cleanup_webcam()
 cv2.destroyAllWindows()

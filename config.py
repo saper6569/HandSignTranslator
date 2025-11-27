@@ -22,3 +22,5 @@ SEQUENCE_LENGTH = 30
 # Frame skip: collect every Nth frame (1 = all frames, 2 = every other frame, etc.)
 FRAME_SKIP = 1
 
+LOW_LIGHT = 2500
+
